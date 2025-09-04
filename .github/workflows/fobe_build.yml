@@ -30,7 +30,7 @@ permissions:
 jobs:
   build:
     name: Build ${{ inputs.board }}
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Clean workspace
         run: |
