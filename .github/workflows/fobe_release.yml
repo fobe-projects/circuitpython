@@ -1,0 +1,256 @@
+name: Release CI
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ci-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  setup:
+    name: Setup
+    strategy:
+      fail-fast: false
+      matrix:
+        port:
+          - espressif
+          - nordic
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Generate matrix
+        id: jsonStep
+        run: |
+          # Get all board directories for the specified port
+          BOARDS_DIR="ports/${{matrix.port}}/boards"
+            if [ -d "$BOARDS_DIR" ]; then
+            # Get all directory names, exclude files, filter for fobe prefix, sort alphabetically
+            BOARDS=$(find "$BOARDS_DIR" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | grep "^fobe" | sort | jq -R -s -c 'split("\n")[:-1]')
+          else
+            echo "Warning: Directory $BOARDS_DIR does not exist"
+            BOARDS="[]"
+          fi
+          echo "Name: $GITHUB_REF_NAME Base: $GITHUB_BASE_REF Ref: $GITHUB_REF"
+          echo "Port: ${{matrix.port}} Boards: $BOARDS"
+          # Output the boards as a JSON object for the current port
+          echo "${{matrix.port}}=$(jq -cn --argjson environments "$BOARDS" '{board: $environments}')" >> $GITHUB_OUTPUT
+    outputs:
+      espressif: ${{ steps.jsonStep.outputs.espressif }}
+      nordic: ${{ steps.jsonStep.outputs.nordic }}
+
+  version:
+    name: Determine Version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Fetch all tags
+        run: |
+          # Add upstream remote and fetch tags from original CircuitPython repository
+          git remote add upstream https://github.com/adafruit/circuitpython.git
+          git fetch upstream --tags --prune --force
+          git fetch origin --tags --prune --force
+      - name: Get version using version.py
+        run: |
+          # Use version.py to get the current version
+          RAW_VERSION=$(python3 py/version.py)
+          echo "Raw version from py/version.py: $RAW_VERSION"
+          
+          # Determine if this is a tagged version or a non-tagged version
+          if [[ "$RAW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+(\.[0-9]+)?)?$ ]]; then
+            # This is a tagged version (e.g., 10.0.0 or 10.0.0-beta.2 or 10.0.0-alpha.1)
+            VERSION_TYPE="tagged"
+            TARGET_VERSION="$RAW_VERSION"
+            echo "This is a tagged version: $RAW_VERSION"
+          elif [[ "$RAW_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+(\.[0-9]+)?)?)-[0-9]+-g[a-f0-9]+$ ]]; then
+            # This is a non-tagged version (e.g., 10.0.0-beta.2-24-g2dc726497f)
+            VERSION_TYPE="non_tagged"
+            # Extract the tag part (everything before -N-gHASH)
+            TARGET_VERSION=$(echo "$RAW_VERSION" | sed -E 's/-[0-9]+-g[a-f0-9]+$//')
+            echo "This is a non-tagged version: $RAW_VERSION"
+            echo "Target release tag: $TARGET_VERSION"
+          else
+            echo "❌ Error: Unrecognized version format: $RAW_VERSION"
+            exit 1
+          fi
+          
+          # Generate firmware tag for file naming
+          FW_DATE=$(date '+%Y%m%d')
+          FW_TAG="-${FW_DATE}-${RAW_VERSION}"
+          
+          echo "Version type: $VERSION_TYPE"
+          echo "Raw version: $RAW_VERSION"
+          echo "Target version: $TARGET_VERSION"
+          echo "Firmware tag: $FW_TAG"
+          
+          echo "version_type=${VERSION_TYPE}" >> $GITHUB_OUTPUT
+          echo "raw_version=${RAW_VERSION}" >> $GITHUB_OUTPUT
+          echo "target_version=${TARGET_VERSION}" >> $GITHUB_OUTPUT
+          echo "firmware_tag=${FW_TAG}" >> $GITHUB_OUTPUT
+        id: version
+    outputs:
+      version_type: ${{ steps.version.outputs.version_type }}
+      raw_version: ${{ steps.version.outputs.raw_version }}
+      target_version: ${{ steps.version.outputs.target_version }}
+      firmware_tag: ${{ steps.version.outputs.firmware_tag }}
+
+  create-release:
+    name: Create or Update Release
+    needs: [setup, version]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Determine release strategy
+        id: strategy
+        run: |
+          VERSION_TYPE="${{ needs.version.outputs.version_type }}"
+          RAW_VERSION="${{ needs.version.outputs.raw_version }}"
+          TARGET_VERSION="${{ needs.version.outputs.target_version }}"
+          
+          echo "Version type: $VERSION_TYPE"
+          echo "Raw version: $RAW_VERSION"
+          echo "Target version: $TARGET_VERSION"
+          
+          # Set release information
+          echo "tag_name=$TARGET_VERSION" >> $GITHUB_OUTPUT
+          echo "release_name=CircuitPython Firmware $TARGET_VERSION" >> $GITHUB_OUTPUT
+          echo "raw_version=$RAW_VERSION" >> $GITHUB_OUTPUT
+          echo "target_version=$TARGET_VERSION" >> $GITHUB_OUTPUT
+          echo "version_type=$VERSION_TYPE" >> $GITHUB_OUTPUT
+
+      - name: Check existing release and handle accordingly
+        id: check_release
+        run: |
+          TAG_NAME="${{ steps.strategy.outputs.tag_name }}"
+          VERSION_TYPE="${{ steps.strategy.outputs.version_type }}"
+          RAW_VERSION="${{ steps.strategy.outputs.raw_version }}"
+
+          # Check if release exists
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Release $TAG_NAME exists"
+            RELEASE_EXISTS=true
+          else
+            echo "Release $TAG_NAME does not exist"
+            RELEASE_EXISTS=false
+          fi
+
+          case "$VERSION_TYPE" in
+            "tagged")
+              if [ "$RELEASE_EXISTS" = true ]; then
+                echo "❌ Release $TAG_NAME already exists for tagged version"
+                echo "Skipping build to prevent duplicate releases"
+                echo "continue=false" >> $GITHUB_OUTPUT
+                exit 0
+              else
+                echo "✅ Tagged version $TAG_NAME does not have a release yet, proceeding with build"
+                echo "continue=true" >> $GITHUB_OUTPUT
+                echo "create_release=true" >> $GITHUB_OUTPUT
+                echo "update_existing=false" >> $GITHUB_OUTPUT
+              fi
+              ;;
+            "non_tagged")
+              if [ "$RELEASE_EXISTS" = true ]; then
+                echo "✅ Found existing release $TAG_NAME for non-tagged version, will update it"
+                echo "continue=true" >> $GITHUB_OUTPUT
+                echo "create_release=false" >> $GITHUB_OUTPUT
+                echo "update_existing=true" >> $GITHUB_OUTPUT
+              else
+                echo "❌ Target release $TAG_NAME does not exist for non-tagged version $RAW_VERSION"
+                echo "Please create the target tag/release first: $TAG_NAME"
+                echo "continue=false" >> $GITHUB_OUTPUT
+                exit 0
+              fi
+              ;;
+            *)
+              echo "❌ Error: Unknown version type: $VERSION_TYPE"
+              echo "continue=false" >> $GITHUB_OUTPUT
+              exit 1
+              ;;
+          esac
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update existing release
+        if: steps.check_release.outputs.update_existing == 'true'
+        run: |
+          TAG_NAME="${{ steps.strategy.outputs.tag_name }}"
+          RAW_VERSION="${{ steps.strategy.outputs.raw_version }}"
+
+          echo "Updating existing release $TAG_NAME with new build from $RAW_VERSION"
+          
+          # Update the release body to reflect the latest build
+          gh release edit "$TAG_NAME" \
+            --title "${{ steps.strategy.outputs.release_name }}" \
+            --notes "**Latest Build**: $RAW_VERSION  
+          **Commit**: ${{ github.sha }}  
+
+          Please select the appropriate firmware file for your development board.
+
+          > ⚠️ Note: This release gets updated automatically with new builds from the development branch."
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Release
+        if: steps.check_release.outputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.strategy.outputs.tag_name }}
+          name: ${{ steps.strategy.outputs.release_name }}
+          body: |
+            **Version**: ${{ steps.strategy.outputs.raw_version }}
+            **Commit**: ${{ github.sha }}
+
+            Please select the appropriate firmware file for your development board.
+          draft: false
+          prerelease: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      release_tag: ${{ steps.strategy.outputs.tag_name }}
+      firmware_tag: ${{ needs.version.outputs.firmware_tag }}
+      continue: ${{ steps.check_release.outputs.continue }}
+
+  build-espressif:
+    name: Build Port Espressif
+    needs: [setup, create-release]
+    if: needs.create-release.outputs.continue == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.espressif) }}
+    uses: ./.github/workflows/fobe_build.yml
+    with:
+      repo_remote: origin
+      repo_ref: ${{ github.sha }}
+      port: espressif
+      board: ${{ matrix.board }}
+      firmware_tag: ${{ needs.create-release.outputs.firmware_tag }}
+      release_tag: ${{ needs.create-release.outputs.release_tag }}
+    secrets: inherit
+
+  build-nordic:
+    name: Build Port Nordic
+    needs: [setup, create-release]
+    if: needs.create-release.outputs.continue == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.nordic) }}
+    uses: ./.github/workflows/fobe_build.yml
+    with:
+      repo_remote: origin
+      repo_ref: ${{ github.sha }}
+      port: nordic
+      board: ${{ matrix.board }}
+      firmware_tag: ${{ needs.create-release.outputs.firmware_tag }}
+      release_tag: ${{ needs.create-release.outputs.release_tag }}
+    secrets: inherit

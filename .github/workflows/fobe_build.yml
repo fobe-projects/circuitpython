@@ -1,0 +1,68 @@
+name: Build CI
+
+on:
+  workflow_call:
+    inputs:
+      repo_remote:
+        required: false
+        type: string
+        default: origin
+      repo_ref:
+        required: false
+        type: string
+        default: ${{ github.sha }}
+      port:
+        required: true
+        type: string
+      board:
+        required: true
+        type: string
+      firmware_tag:
+        required: true
+        type: string
+      release_tag:
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ inputs.board }}
+    runs-on: self-hosted
+    steps:
+      - name: Clean workspace
+        run: |
+          sudo rm -rf bin
+          sudo rm -rf ${{ inputs.board }}
+          mkdir -p bin
+
+      - name: Build board ${{ inputs.board }}
+        uses: fobe-projects/action-circuitpython-builder@main
+        with:
+          repo_remote: ${{ inputs.repo_remote }}
+          repo_ref: ${{ inputs.repo_ref }}
+          port: ${{ inputs.port }}
+          board: ${{ inputs.board }}
+
+      - name: Package binaries
+        run: |
+          sudo mv bin ${{ inputs.board }}
+          tar -cJf ${{ inputs.board }}${{ inputs.firmware_tag }}.tar.xz ${{ inputs.board }}
+
+      - name: Upload binaries to release
+        if: ${{ inputs.release_tag != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: ${{ inputs.board }}${{ inputs.firmware_tag }}.tar.xz
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Store binaries as an artifact
+        if: ${{ inputs.release_tag == '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.board }}${{ inputs.firmware_tag }}
+          overwrite: true
+          path: ${{ inputs.board }}${{ inputs.firmware_tag }}.tar.xz
